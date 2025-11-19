@@ -12,6 +12,7 @@ from av.codec import CodecContext
 from av.error import InvalidDataError
 
 from .const import (
+    EVENT_AUDIO,
     EVENT_DISCONNECT,
     EVENT_FRAME,
     EVENT_INIT,
@@ -36,6 +37,9 @@ class Client:
         codec_name: Optional[str] = None,
         new_display: Union[str, bool] = False,
         start_app: Optional[str] = None,
+        audio: bool = False,
+        audio_codec: str = "opus",
+        audio_bit_rate: int = 128000,
     ):
         """
         Create a scrcpy client, this client won't be started until you call the start function
@@ -71,6 +75,7 @@ class Client:
             "c2.android.avc.encoder",
         ]
         assert codec_name in [None, "h264", "h265", "av1"]
+        assert audio_codec in ["opus", "aac", "raw"], "audio_codec must be opus, aac, or raw"
 
         # Check new_display format
         if new_display:
@@ -106,6 +111,9 @@ class Client:
         self.codec_name = codec_name
         self.new_display = new_display
         self.start_app = start_app
+        self.audio = audio
+        self.audio_codec = audio_codec
+        self.audio_bit_rate = audio_bit_rate
 
 
         # Connect to device
@@ -115,7 +123,7 @@ class Client:
             device = adb.device(serial=device)
 
         self.device = device
-        self.listeners = dict(frame=[], init=[], disconnect=[])
+        self.listeners = dict(frame=[], init=[], audio=[], disconnect=[])
 
         # User accessible
         self.last_frame: Optional[np.ndarray] = None
@@ -127,16 +135,22 @@ class Client:
         self.alive = False
         self.__server_stream: Optional[AdbConnection] = None
         self.__video_socket: Optional[socket.socket] = None
+        self.__audio_socket: Optional[socket.socket] = None
         self.control_socket: Optional[socket.socket] = None
         self.control_socket_lock = threading.Lock()
 
         # Available if start with threaded or daemon_threaded
         self.stream_loop_thread = None
+        self.audio_loop_thread = None
 
     def __init_server_connection(self) -> None:
         """
-        Connect to android server, there will be two sockets, video and control socket.
-        This method will set: video_socket, control_socket, resolution variables
+        Connect to android server with 2 or 3 sockets in this order:
+        1. video_socket (always)
+        2. audio_socket (if audio enabled)
+        3. control_socket (always)
+        
+        This order MUST match the server's accept() order in DesktopConnection.java
         """
         for _ in range(self.connection_timeout // 100):
             try:
@@ -154,9 +168,23 @@ class Client:
         if not len(dummy_byte) or dummy_byte != b"\x00":
             raise ConnectionError("Did not receive Dummy Byte!")
 
+        # Initialize audio socket if audio is enabled (MUST be before control socket)
+        # Server accept order: 1. video, 2. audio (if enabled), 3. control
+        if self.audio:
+            try:
+                self.__audio_socket = self.device.create_connection(
+                    Network.LOCAL_ABSTRACT, "scrcpy"
+                )
+                self.__audio_socket.setblocking(False)
+            except Exception as e:
+                print(f"Warning: Failed to create audio socket: {e}")
+                self.__audio_socket = None
+        
+        # Control socket must be created AFTER audio socket (if audio enabled)
         self.control_socket = self.device.create_connection(
             Network.LOCAL_ABSTRACT, "scrcpy"
         )
+        
         self.device_name = self.__video_socket.recv(64).decode("utf-8").rstrip("\x00")
         if not len(self.device_name):
             raise ConnectionError("Did not receive Device Name!")
@@ -191,7 +219,9 @@ class Client:
             "tunnel_forward=true",
             "send_frame_meta=false",
             "control=true",
-            "audio=false",
+            f"audio={'true' if self.audio else 'false'}",
+            f"audio_codec={self.audio_codec}" if self.audio else "audio_codec=opus",
+            f"audio_bit_rate={self.audio_bit_rate}" if self.audio else "audio_bit_rate=128000",
             "show_touches=false",
             "stay_awake=false",
             "power_off_on_close=false",
@@ -210,7 +240,7 @@ class Client:
 
     def start(self, threaded: bool = False, daemon_threaded: bool = False) -> None:
         """
-        Start listening video stream
+        Start listening video stream (and audio stream if enabled)
 
         Args:
             threaded: Run stream loop in a different thread to avoid blocking
@@ -231,7 +261,21 @@ class Client:
                 target=self.__stream_loop, daemon=daemon_threaded
             )
             self.stream_loop_thread.start()
+            
+            # Start audio loop if audio is enabled
+            if self.audio and self.__audio_socket:
+                self.audio_loop_thread = threading.Thread(
+                    target=self.__audio_loop, daemon=daemon_threaded
+                )
+                self.audio_loop_thread.start()
         else:
+            # In blocking mode, only video stream is processed
+            # Audio would require separate thread anyway
+            if self.audio and self.__audio_socket:
+                self.audio_loop_thread = threading.Thread(
+                    target=self.__audio_loop, daemon=True
+                )
+                self.audio_loop_thread.start()
             self.__stream_loop()
 
     def stop(self) -> None:
@@ -254,6 +298,12 @@ class Client:
         if self.__video_socket is not None:
             try:
                 self.__video_socket.close()
+            except Exception:
+                pass
+        
+        if self.__audio_socket is not None:
+            try:
+                self.__audio_socket.close()
             except Exception:
                 pass
 
@@ -287,6 +337,48 @@ class Client:
                     self.__send_to_listeners(EVENT_DISCONNECT)
                     self.stop()
                     raise e
+
+    def __audio_loop(self) -> None:
+        """
+        Core loop for audio parsing
+        """
+        try:
+            # Create audio codec context based on audio_codec
+            if self.audio_codec == "opus":
+                audio_codec = CodecContext.create("opus", "r")
+            elif self.audio_codec == "aac":
+                audio_codec = CodecContext.create("aac", "r")
+            else:
+                # Raw audio, no decoding needed
+                audio_codec = None
+            
+            while self.alive:
+                try:
+                    raw_audio = self.__audio_socket.recv(0x10000)
+                    if raw_audio == b"":
+                        print("Audio stream disconnected")
+                        break
+                    
+                    if audio_codec:
+                        # Decode audio
+                        packets = audio_codec.parse(raw_audio)
+                        for packet in packets:
+                            frames = audio_codec.decode(packet)
+                            for frame in frames:
+                                # Convert audio frame to numpy array
+                                audio_data = frame.to_ndarray()
+                                self.__send_to_listeners(EVENT_AUDIO, audio_data)
+                    else:
+                        # Raw audio, send directly
+                        self.__send_to_listeners(EVENT_AUDIO, raw_audio)
+                        
+                except BlockingIOError:
+                    time.sleep(0.01)
+                except Exception as e:
+                    print(f"Audio loop error: {e}")
+                    time.sleep(0.01)
+        except Exception as e:
+            print(f"Audio loop initialization error: {e}")
 
     def add_listener(self, cls: str, listener: Callable[..., Any]) -> None:
         """
