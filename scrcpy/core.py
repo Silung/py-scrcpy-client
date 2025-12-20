@@ -40,6 +40,7 @@ class Client:
         audio: bool = False,
         audio_codec: str = "opus",
         audio_bit_rate: int = 128000,
+        audio_source: str = "playback",
     ):
         """
         Create a scrcpy client, this client won't be started until you call the start function
@@ -56,6 +57,13 @@ class Client:
             connection_timeout: timeout for connection, unit is ms
             encoder_name: encoder name, enum: [OMX.google.h264.encoder, OMX.qcom.video.encoder.avc, c2.qti.avc.encoder, c2.android.avc.encoder], default is None (Auto)
             codec_name: codec name, enum: [h264, h265, av1], default is None (Auto)
+            audio: enable audio forwarding (requires Android 11+)
+            audio_codec: audio codec, enum: [opus, aac, raw], default is opus
+            audio_bit_rate: audio bit rate, default is 128000
+            audio_source: audio source, enum: [output, mic, playback], default is output
+                - output: capture device audio output (default, Android 11+)
+                - mic: capture microphone input (Android 11+)
+                - playback: capture playback audio (Android 13+)
         """
         # Check Params
         assert max_width >= 0, "max_width must be greater than or equal to 0"
@@ -76,6 +84,7 @@ class Client:
         ]
         assert codec_name in [None, "h264", "h265", "av1"]
         assert audio_codec in ["opus", "aac", "raw"], "audio_codec must be opus, aac, or raw"
+        assert audio_source in ["output", "mic", "playback"], "audio_source must be output, mic, or playback"
 
         # Check new_display format
         if new_display:
@@ -114,6 +123,7 @@ class Client:
         self.audio = audio
         self.audio_codec = audio_codec
         self.audio_bit_rate = audio_bit_rate
+        self.audio_source = audio_source
 
 
         # Connect to device
@@ -222,6 +232,7 @@ class Client:
             f"audio={'true' if self.audio else 'false'}",
             f"audio_codec={self.audio_codec}" if self.audio else "audio_codec=opus",
             f"audio_bit_rate={self.audio_bit_rate}" if self.audio else "audio_bit_rate=128000",
+            f"audio_source={self.audio_source}" if self.audio else "audio_source=playback",
             "show_touches=false",
             "stay_awake=false",
             "power_off_on_close=false",
